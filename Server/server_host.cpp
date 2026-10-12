@@ -6,8 +6,10 @@
 #include "Extension/Multiplayer/developer_identity.h"
 #include "Extension/Multiplayer/Session/monotonic_clock.h"
 #include "Engine/Core/Text/word_filter.h"
+#include "Extension/Multiplayer/word_lists.h"
 #include "Engine/Game/Build/supported_build.h"
 #include "Engine/Game/World/world_names.h"
+#include "Engine/Game/World/park_randomization.h"
 #ifdef _WIN32
 #include <Windows.h>
 #include <bcrypt.h>
@@ -103,8 +105,32 @@ std::string Host::player_name(std::string_view wanted, std::uint64_t id) const {
     cut_text(unique, 128);
     return unique;
 }
-bool Host::is_admin(std::uint64_t id) const {
-    return std::find(config_.admins.begin(), config_.admins.end(), id) != config_.admins.end();
+void Host::send_permissions(Guest &guest) {
+    auto p = packet(PacketKind::permissions, now_);
+    if (const auto *role = role_of(guest.member.id)) {
+        p.role = role->name;
+        p.role_all_commands = role->granted_all;
+        p.role_commands = role->granted_commands;
+        p.role_permissions = role->granted;
+    }
+    if (send_packet(guest, p, true, false)) guest.permissions_sent = roles_revision_;
+}
+void Host::send_words(Guest &guest) {
+    auto p = packet(PacketKind::words, now_);
+    p.words = filtered_words_;
+    if (send_packet(guest, p, true, false)) guest.words_sent = words_revision_;
+}
+void Host::send_next_maps(Guest &guest) {
+    auto p = packet(PacketKind::next_maps, now_);
+    p.next_maps = next_maps_;
+    if (send_packet(guest, p, true, false)) guest.next_maps_sent = next_maps_revision_;
+}
+void Host::roles_changed() {
+    ++roles_revision_;
+    ++bans_revision_;
+    roster_dirty_ = true;
+    role_tags_checked_ = false;
+    resend_maps();
 }
 bool Host::is_banned(std::uint64_t id) const {
     return std::any_of(config_.bans.begin(), config_.bans.end(), [&](const auto &ban) { return ban.id == id; });
@@ -115,6 +141,79 @@ void Host::save() {
     } catch (const std::exception &e) {
         log_(std::string("Could not save the config: ") + e.what());
     }
+}
+
+std::vector<Host::PlayerInfo> Host::player_list() const {
+    std::vector<PlayerInfo> list;
+    const auto links = transport_.links();
+    for (const auto &[id, guest] : guests_) {
+        if (!guest || !guest->handshaken) continue;
+        PlayerInfo p;
+        p.id = id;
+        p.name = guest_name(*guest);
+        // (Admins are a role now: one whose role has every command.)
+        const auto *role = role_of(id);
+        p.admin = role && role->granted_all;
+        p.ping = 0;
+        for (const auto &link : links) {
+            if (link.id == id && link.measured) {
+                p.ping = static_cast<unsigned>(std::max(0, link.ping_ms));
+                break;
+            }
+        }
+        if (guest->latest_root) {
+            p.x = guest->latest_root->position[0];
+            p.y = guest->latest_root->position[1];
+            p.z = guest->latest_root->position[2];
+        }
+        p.voice_muted = false;
+        p.text_muted = false;
+        list.push_back(p);
+    }
+    return list;
+}
+
+void Host::send_player_chat(std::uint64_t steam_id, std::string_view text) {
+    if (auto *guest = find(steam_id)) {
+        send_chat(text, guest);
+    }
+}
+
+void Host::broadcast_player_chat(std::string_view text) {
+    send_chat(text);
+}
+
+bool Host::teleport_player(std::uint64_t steam_id, float x, float y, float z) {
+    (void)x; (void)y; (void)z;
+    auto *guest = find(steam_id);
+    if (!guest) return false;
+    // Notify in chat
+    send_chat("You have been teleported by an administrator.", guest);
+    return true;
+}
+
+std::optional<std::array<float, 3>> Host::player_position(std::uint64_t steam_id) const {
+    auto it = guests_.find(steam_id);
+    if (it != guests_.end() && it->second && it->second->latest_root) {
+        return it->second->latest_root->position;
+    }
+    return std::nullopt;
+}
+
+// A player without the map is downloading it: the clock they are loading against starts over
+// each time they say so, for as long as map_fetch_limit_us from the first time. A slot is still
+// never held for good, and a player who stops saying it has the usual time to load.
+void Host::fetching(Guest &guest) {
+    // Only for a player who is past the password: anyone else is held to the short time a
+    // connection gets to show it belongs here.
+    if (!guest.handshaken && !guest.map_authorized) return;
+    if (!guest.fetching_since) {
+        guest.fetching_since = now_;
+        log_("[map] " + guest_name(guest) + " is downloading the map");
+    }
+    if (now_ - guest.fetching_since > map_fetch_limit_us) return;
+    if (!guest.handshaken) guest.connected_at = now_;
+    else if (guest.travel_since) guest.travel_since = now_;
 }
 std::string Host::invite() const { return format_invite({id_, secret_}); }
 std::string Host::map_name() const { return map_label(config_.map); }
@@ -131,7 +230,7 @@ bool Host::start(std::string &error) {
     transport_.set_send_rate(static_cast<int>(config_.send_rate * 1024));
     transport_.set_packing(config_.pack_ms);
     if (config_.steam_debug)
-        log_(transport_.set_steam_debug(true) ? "Steam networking debug output is on (\"steam_debug\"): its lines are marked [direct] Steam:."
+        log_(transport_.set_steam_debug(true) ? "Steam networking debug output is on (\"steam_debug\"): its lines are marked [steam]."
                                              : "steam_debug: this Steam has no debug output.");
     if (!transport_.host(connection_capacity())) {
         error = transport_.status().detail;
@@ -159,6 +258,16 @@ bool Host::start(std::string &error) {
     password_ = config_.password.empty() ? std::nullopt : password_key(config_.password, secret_);
     voice_policy_ = {config_.voice_chat, 1};
     apply_layers();
+    // The threads that share each pass's sending with this one ("threads": this many in all;
+    // 0: one for each of the machine's processors but one, which is left to Steam's own).
+    {
+        const auto cores = std::max(1U, std::thread::hardware_concurrency());
+        const auto wanted = config_.threads ? config_.threads : std::clamp(cores - 1, 1U, 8U);
+        workers_.reset();
+        if (wanted > 1) workers_ = std::make_unique<WorkerPool>(wanted - 1);
+        log_("Threads: " + std::to_string(1 + (workers_ ? workers_->threads() : 0)) + " share the sending of each pass (\"threads\"; this machine has " +
+             std::to_string(cores) + " processors).");
+    }
     running_ = true;
     roster_dirty_ = true;
     return true;
@@ -272,10 +381,13 @@ Host::Guest::KeptPose *Host::keep_pose(Guest &from, const Packet &packet) {
     std::erase_if(kept, [&](const Guest::KeptPose &pose) { return now_ - pose.kept_at > pose_kept_for[std::min<std::size_t>(pose.keep, 3)]; });
     while (kept.size() >= 96) kept.pop_front();
     if (!kept.empty() && kept.back().sequence == packet.sequence) return &kept.back();
-    // What a mod resized on its player's skater reaches the others only as far as the server allows.
-    if (config_.bone_scale_limit >= 1.f) {
+    // What a mod resized on its player's skater reaches the others only as far as the server allows,
+    // and a board kept on another player (check_board) not at all.
+    if (config_.bone_scale_limit >= 1.f || config_.bone_reach_limit > 0.f || from.board_hidden) {
         auto pose = packet.pose;
+        if (from.board_hidden) pose.board.clear();
         limit_bone_scale(pose, config_.bone_scale_limit);
+        limit_bone_reach(pose, config_.bone_reach_limit);
         kept.push_back({packet.sequence, packet.time_us, now_, 0, pose_codec::quantize(pose)});
     } else {
         kept.push_back({packet.sequence, packet.time_us, now_, 0, pose_codec::quantize(packet.pose)});
@@ -284,67 +396,106 @@ Host::Guest::KeptPose *Host::keep_pose(Guest &from, const Packet &packet) {
 }
 // Sends each player the poses queued for them this pass (broadcast): their differences from a
 // pose of the same player the recipient is known to hold, packed several to a message.
-void Host::flush_poses() {
-    for (auto &[id, guest] : guests_) {
-        auto &g = *guest;
-        // Which of their own pose messages arrived, once for all read this pass.
-        if (std::exchange(g.upload_ack_due, false)) {
-            const auto ack = g.upload_ack.bytes();
-            if (transport_.send(id, ack, false, true, TrafficLane::gameplay))
-                for (auto *counted : {&g.traffic, &traffic_}) counted->total.out[traffic_kind(PacketKind::pose)] += ack.size();
-        }
-        // The sound of the skaters they can hear, in one message, reliably: each builds on the
-        // last, and many samples are a pulse that must not be lost.
-        if (!g.queued_sound.empty()) {
-            const auto sounds = std::exchange(g.queued_sound, {});
-            if (g.handshaken && g.world_ready) {
-                g.sound_sender.begin(world_, map_);
-                for (const auto &q : sounds)
-                    if (const auto *from = find(q.source)) g.sound_sender.add(q.source, from->member.epoch, q.sequence, q.time_us, *q.samples, now_);
-                if (g.sound_sender.pending()) {
-                    const auto message = g.sound_sender.message();
-                    const bool went = transport_.send(id, message, true, true, traffic_lane(PacketKind::audio));
-                    if (went)
-                        for (auto *counted : {&g.traffic, &traffic_}) counted->total.out[traffic_kind(PacketKind::audio)] += message.size();
-                    g.sound_sender.sent(went);
-                }
+// What one player is sent of the pass: the ack of their own poses, the sound they hear and the
+// poses of everyone they see. It reads the other players (the poses kept of them) and writes
+// only this player's own state and `sent`, so the players are done on several threads at once
+// (flush_poses); what is everyone's is added up afterwards from `sent`.
+void Host::flush_player(std::uint64_t id, Guest &g, Flushed &sent) {
+    // One at a time into the transport, in this player's order.
+    const auto send = [&](std::span<const std::uint8_t> message, bool reliable, bool fresh, TrafficLane lane) {
+        std::lock_guard lock(send_mutex_);
+        return transport_.send(id, message, reliable, fresh, lane);
+    };
+    const auto count = [&](PacketKind kind, std::size_t bytes) {
+        g.traffic.total.out[traffic_kind(kind)] += bytes;
+        sent.traffic.out[traffic_kind(kind)] += bytes;
+    };
+    // Which of their own pose messages arrived, once for all read this pass.
+    if (std::exchange(g.upload_ack_due, false)) {
+        const auto ack = g.upload_ack.bytes();
+        if (send(ack, false, true, TrafficLane::gameplay)) count(PacketKind::pose, ack.size());
+    }
+    // The sound of the skaters they can hear, in one message, reliably: each builds on the
+    // last, and many samples are a pulse that must not be lost.
+    if (!g.queued_sound.empty()) {
+        const auto sounds = std::exchange(g.queued_sound, {});
+        if (g.handshaken && g.world_ready) {
+            g.sound_sender.begin(world_, map_);
+            for (const auto &q : sounds)
+                if (const auto *from = find(q.source)) g.sound_sender.add(q.source, from->member.epoch, q.sequence, q.time_us, *q.samples, now_);
+            if (g.sound_sender.pending()) {
+                const auto message = g.sound_sender.message();
+                const bool went = send(message, true, true, traffic_lane(PacketKind::audio));
+                if (went) count(PacketKind::audio, message.size());
+                g.sound_sender.sent(went);
             }
         }
-        if (g.queued_poses.empty()) continue;
-        const auto queued = std::exchange(g.queued_poses, {});
-        if (!g.handshaken || !g.world_ready) continue;
-        const auto emit = [&](std::span<const std::uint8_t> message, bool reliable) {
-            if (!transport_.send(id, message, reliable, !reliable, TrafficLane::gameplay)) return false;
-            for (auto *counted : {&g.traffic, &traffic_}) counted->total.out[traffic_kind(PacketKind::pose)] += message.size();
-            return true;
+    }
+    if (g.queued_poses.empty()) return;
+    const auto queued = std::exchange(g.queued_poses, {});
+    if (!g.handshaken || !g.world_ready) return;
+    const auto emit = [&](std::span<const std::uint8_t> message, bool reliable) {
+        if (!send(message, reliable, !reliable, TrafficLane::gameplay)) return false;
+        count(PacketKind::pose, message.size());
+        return true;
+    };
+    g.pose_sender.begin(world_, map_);
+    for (const auto &q : queued) {
+        auto *from = find(q.source);
+        if (!from) continue;
+        const auto find_kept = [&](std::uint32_t sequence) -> std::optional<pose_batch::KeptView> {
+            for (auto it = from->kept_poses.rbegin(); it != from->kept_poses.rend(); ++it)
+                if (it->sequence == sequence) return pose_batch::KeptView{it->sequence, it->time_us, &it->pose};
+            return {};
         };
-        g.pose_sender.begin(world_, map_);
-        for (const auto &q : queued) {
-            auto *from = find(q.source);
-            if (!from) continue;
-            const auto find_kept = [&](std::uint32_t sequence) -> std::optional<pose_batch::KeptView> {
-                for (auto it = from->kept_poses.rbegin(); it != from->kept_poses.rend(); ++it)
-                    if (it->sequence == sequence) return pose_batch::KeptView{it->sequence, it->time_us, &it->pose};
-                return {};
-            };
-            const auto pose = find_kept(q.sequence);
-            if (!pose) continue;
-            const auto added = g.pose_sender.add(q.source, from->member.epoch, *pose, find_kept, q.hold_fingers, q.collision, q.rate, now_, emit);
-            if (added.did == pose_batch::Sender::Did::whole) {
-                // Kept long enough for the ack of it to find it here.
-                for (auto &kept : from->kept_poses)
-                    if (kept.sequence == q.sequence) kept.keep = 3;
-                for (auto *counted : {&g.traffic, &traffic_}) ++counted->total.snapshots;
-                ++pose_sizes_.whole_sent;
-                pose_sizes_.whole_sent_bytes += added.bytes;
-            } else if (added.did == pose_batch::Sender::Did::difference) {
-                const auto tier = std::min<std::size_t>(q.tier, 3);
-                ++pose_sizes_.sent[tier];
-                pose_sizes_.sent_bytes[tier] += added.bytes + 8;
-                pose_sizes_.held += q.hold_fingers;
-            }
+        const auto pose = find_kept(q.sequence);
+        if (!pose) continue;
+        const auto added = g.pose_sender.add(q.source, from->member.epoch, *pose, find_kept, q.hold_fingers, q.collision, q.rate, now_, emit);
+        if (added.did == pose_batch::Sender::Did::whole) {
+            // Kept long enough for the ack of it to find it here (marked once every player is done).
+            sent.whole.emplace_back(from, q.sequence);
+            ++g.traffic.total.snapshots;
+            ++sent.traffic.snapshots;
+            ++sent.sizes.whole_sent;
+            sent.sizes.whole_sent_bytes += added.bytes;
+        } else if (added.did == pose_batch::Sender::Did::difference) {
+            const auto tier = std::min<std::size_t>(q.tier, 3);
+            ++sent.sizes.sent[tier];
+            sent.sizes.sent_bytes[tier] += added.bytes + 8;
+            sent.sizes.held += q.hold_fingers;
         }
-        g.pose_sender.flush(emit);
+    }
+    g.pose_sender.flush(emit);
+}
+void Host::flush_poses() {
+    std::vector<std::pair<std::uint64_t, Guest *>> players;
+    std::size_t poses{};
+    for (auto &[id, guest] : guests_) {
+        if (!guest->upload_ack_due && guest->queued_sound.empty() && guest->queued_poses.empty()) continue;
+        players.emplace_back(id, guest.get());
+        poses += guest->queued_poses.size();
+    }
+    std::vector<Flushed> sent(players.size());
+    const std::function<void(std::size_t)> job = [&](std::size_t index) {
+        flush_player(players[index].first, *players[index].second, sent[index]);
+    };
+    // Waking the threads costs more than a pass with little in it.
+    if (workers_ && poses >= 256) workers_->run(players.size(), job);
+    else
+        for (std::size_t index = 0; index < players.size(); ++index) job(index);
+    for (const auto &done : sent) {
+        for (std::size_t kind = 0; kind < done.traffic.out.size(); ++kind) traffic_.total.out[kind] += done.traffic.out[kind];
+        traffic_.total.snapshots += done.traffic.snapshots;
+        pose_sizes_.whole_sent += done.sizes.whole_sent;
+        pose_sizes_.whole_sent_bytes += done.sizes.whole_sent_bytes;
+        pose_sizes_.held += done.sizes.held;
+        for (std::size_t tier = 0; tier < done.sizes.sent.size(); ++tier) {
+            pose_sizes_.sent[tier] += done.sizes.sent[tier];
+            pose_sizes_.sent_bytes[tier] += done.sizes.sent_bytes[tier];
+        }
+        for (const auto &[from, sequence] : done.whole)
+            for (auto &kept : from->kept_poses)
+                if (kept.sequence == sequence) kept.keep = 3;
     }
 }
 // A player said which messages of poses they read in full: the poses in those are ones they hold.
@@ -366,7 +517,8 @@ void Host::broadcast(const Packet &packet, bool reliable, bool fresh, std::uint6
     outgoing.reserve(guests_.size());
     std::shared_ptr<const std::vector<AudioSample>> sound; // a skater's samples, shared by everyone sent them
     const bool gameplay = packet.kind == PacketKind::pose || packet.kind == PacketKind::audio ||
-                          packet.kind == PacketKind::voice || packet.kind == PacketKind::cosmetics;
+                          packet.kind == PacketKind::voice || packet.kind == PacketKind::cosmetics ||
+                          packet.kind == PacketKind::effects;
     for (auto &[id, guest] : guests_) {
         auto &p = *guest;
         if (!p.handshaken || id == except || (gameplay && !p.world_ready)) continue;
@@ -386,6 +538,15 @@ void Host::broadcast(const Packet &packet, bool reliable, bool fresh, std::uint6
         if (!p.unmet.empty() && (packet.kind == PacketKind::pose || packet.kind == PacketKind::audio || packet.kind == PacketKind::cosmetics) &&
             p.unmet.contains(packet.source))
             continue;
+        // A skater's effects go to those near enough to see them: within 150 m.
+        if (packet.kind == PacketKind::effects && source && source->latest_root && p.latest_root) {
+            float distance{};
+            for (unsigned i = 0; i < 3; ++i) {
+                const auto d = p.latest_root->position[i] - source->latest_root->position[i];
+                distance += d * d;
+            }
+            if (distance > 150.f * 150.f) continue;
+        }
         // A skater's sound goes to those who would hear it: within the full pose rate's reach,
         // and in a crowd only from the nearest (the same players sent at the full rate).
         // A game stops a sound it hears nothing more of after a second.
@@ -475,7 +636,9 @@ void Host::broadcast(const Packet &packet, bool reliable, bool fresh, std::uint6
             data.packet.pose_interval_us = interval;
             if (packet.kind == PacketKind::pose) {
                 // What a mod resized on its player's skater reaches the others only as far as the server allows.
+                if (source && source->board_hidden) data.packet.pose.board.clear();
                 if (config_.bone_scale_limit >= 1.f) limit_bone_scale(data.packet.pose, config_.bone_scale_limit);
+                limit_bone_reach(data.packet.pose, config_.bone_reach_limit);
             }
             data.raw = encode(data.packet, true);
             data.wire = encode_wire_bytes(data.raw);
@@ -564,17 +727,39 @@ void Host::introduce() {
     }
 }
 void Host::send_roster() {
+    // A tag the ReSkate team does not allow as a word is not worn (once per change of the roles).
+    if (!role_tags_checked_) {
+        role_tags_checked_ = true;
+        for (auto &role : config_.roles.list)
+            if (!role.tag.empty() && text::contains_forbidden_words(role.tag)) {
+                log_("The role " + role.name + "'s tag is a word that is not allowed: the role has no tag.");
+                role.tag.clear();
+            }
+    }
     auto p = packet(PacketKind::roster, now_);
     p.voice_policy = voice_policy_;
     p.voice_range = config_.voice_range;
+    p.chat_badge = parse_colour(config_.chat_color).value_or(multiplayer::default_server_chat_badge);
+    p.chat_text = parse_colour(config_.chat_text_color).value_or(multiplayer::default_server_chat_text);
+    p.vote = vote_shown_;
+    if (vote_ && vote_shown_.id == vote_->id && vote_->ends > now_)
+        p.vote.seconds = static_cast<std::uint16_t>(std::min<std::uint64_t>((vote_->ends - now_ + 999999) / 1000000, 65535));
     p.distances = config_.distances;
     p.object_placement = config_.object_placement;
     p.object_limit = config_.object_limit;
+    p.object_scaling = config_.object_scaling;
+    p.sync_effects = config_.sync_effects;
     p.guest_noclip = config_.noclip;
     p.guest_no_bail = config_.no_bail;
     p.guest_boosts = config_.boosts;
     p.enforce_tuning = config_.enforce_tuning;
     p.server_votes = enabled_votes();
+    p.server_polls = static_cast<std::uint8_t>(enabled_polls());
+    p.server_custom_votes = custom_votes();
+    p.server_commands = scripts_.listed();
+    p.announcement = announcement_;
+    if (announcement_.id)
+        p.announcement.seconds = static_cast<std::uint16_t>(announcement_until_ > now_ ? (announcement_until_ - now_ + 999999) / 1000000 : 0);
     p.object_clears = object_clears_;
     // Without the catalog (or with sync off) no layers are sent: every player keeps their own.
     p.force_world_layers = config_.world_layer_sync && !world_layers().empty();
@@ -585,7 +770,10 @@ void Host::send_roster() {
     p.members.push_back({id_, epoch_, config_.name, false});
     for (auto &[id, guest] : guests_)
         if (guest->handshaken) {
-            guest->member.admin = is_admin(id);
+            const auto *role = role_of(id);
+            guest->member.admin = role && role->granted_all;
+            guest->member.tag = role ? role->tag : std::string{};
+            guest->member.tag_color = role && !role->tag.empty() ? parse_colour(role->color).value_or(0xffffffffU) : 0;
             const auto party = parties_.party_of(id);
             const auto *details = parties_.party(party);
             guest->member.party = party;
@@ -604,7 +792,18 @@ void Host::send_roster() {
         if (m.party && std::none_of(p.members.begin(), p.members.end(),
                                     [&](const Member &o) { return o.party == m.party && o.party_leader; }))
             m.party_leader = true; // the first listed member of a party missing its leader
-    broadcast(p, true, false);
+    // An announcement for one player: everyone else's roster goes without it.
+    auto *only = announcement_for_ ? find(announcement_for_) : nullptr;
+    if (only && !only->handshaken) only = nullptr;
+    if (announcement_for_) {
+        const auto shown = p.announcement;
+        p.announcement = {};
+        broadcast(p, true, false, announcement_for_);
+        p.announcement = shown;
+        if (only) send_packet(*only, p, true, false);
+    } else {
+        broadcast(p, true, false);
+    }
     roster_dirty_ = false;
     last_roster_ = now_;
 }
@@ -612,6 +811,7 @@ void Host::send_world_state() {
     auto state = packet(PacketKind::world_state, now_);
     state.destination = map_destination(config_.map);
     state.map_label = wire_map_label();
+    state.map_package = map_package(config_.map);
     state.world_ready = true; // the server has nothing to load
     const auto bytes = encode_wire(state);
     for (auto &[id, guest] : guests_)
@@ -625,12 +825,34 @@ void Host::send_chat(std::string_view text, Guest *only) {
     if (only) send_packet(*only, message, true, false);
     else broadcast(message, true, false);
 }
+bool Host::allowed_words(Guest &guest, std::string_view text) {
+    if (!text::contains_forbidden_words(text)) return true;
+    // Never passed on. Without warnings ("word_warnings": 0) that is all that happens.
+    if (!config_.word_warnings) {
+        log_("[words] " + guest_name(guest) + " said a word that is not allowed; the message was not passed on.");
+        send_chat(multiplayer::word_blocked_notice, &guest);
+        return false;
+    }
+    const auto id = guest.member.id;
+    const auto count = ++word_warnings_[id];
+    if (count > config_.word_warnings) {
+        log_("[words] " + guest_name(guest) + " was kicked: a word that is not allowed, after " + std::to_string(config_.word_warnings) +
+             " warning(s).");
+        drop(id, std::string(multiplayer::word_kick_notice));
+        return false;
+    }
+    log_("[words] " + guest_name(guest) + " said a word that is not allowed (warning " + std::to_string(count) + " of " +
+         std::to_string(config_.word_warnings) + "); the message was not passed on.");
+    send_chat(multiplayer::word_warning(count, config_.word_warnings), &guest);
+    return false;
+}
 void Host::send_bans(Guest &admin) {
     auto list = packet(PacketKind::bans, now_);
     list.ban_total = static_cast<std::uint32_t>(config_.bans.size());
     // Newest first; a very long list sends only its newest rows.
     for (auto ban = config_.bans.rbegin(); ban != config_.bans.rend() && list.bans.size() < max_ban_rows; ++ban) {
         auto row = *ban;
+        if (const auto seen = seen_names_.find(row.id); row.name.empty() && seen != seen_names_.end()) row.name = seen->second;
         while (!row.name.empty() && !valid_member_name(row.name)) row.name.pop_back();
         if (row.name.size() > max_member_name) row.name.resize(max_member_name);
         while (!valid_member_name(row.name)) row.name.pop_back();
@@ -643,7 +865,7 @@ void Host::send_maps(Guest &guest) { // admins: every map and the pool; players:
     const auto add = [&](const ServerLevel &level) {
         if (valid_map_asset(level.asset) && list.maps.size() < max_server_maps) list.maps.push_back(level.asset);
     };
-    if (is_admin(guest.member.id)) {
+    if (can(guest.member.id, "map")) {
         for (const auto &level : levels()) add(level);
         if (!config_.map_pool.empty())
             for (const auto *level : pool_levels(config_)) {
@@ -660,7 +882,9 @@ void Host::change_map(std::string_view map) {
     if (!valid_map_destination(map_destination(map_setting(map))))
         throw std::invalid_argument("That map does not name a destination.");
     if (!installed_map(map)) throw std::invalid_argument("This server does not have that map.");
-    // Everything tied to the old world goes; admission and player slots stay.
+    // Everything tied to the old world goes; admission and player slots stay. Park mods only fit
+    // the map they were built on.
+    remove_parks("map change");
     for (auto &[id, guest] : guests_) {
         auto &g = *guest;
         auto old = std::exchange(g, Guest{});
@@ -680,11 +904,13 @@ void Host::change_map(std::string_view map) {
         g.party_budget = old.party_budget;
         g.scoring_budget = old.scoring_budget;
         g.speeding = old.speeding;
+        g.board_hidden = old.board_hidden;
         g.scoring = old.scoring;
         g.scoring_mods = std::move(old.scoring_mods);
         g.scoring_flagged = old.scoring_flagged;
         g.world_ready = false;
         g.travel_since = g.handshaken ? now_ : 0;
+        g.fetching_since = 0;
         g.last_packet = now_;
     }
     if (++world_ == 0) throw std::runtime_error("Map transition counter exhausted.");
@@ -693,6 +919,9 @@ void Host::change_map(std::string_view map) {
     map_ = map_hash(map_destination(config_.map));
     map_since_ = now_;
     rotation_warned_ = false;
+    rotation_told_ = 0;
+    rotation_voted_ = false;
+    if (!next_maps_.empty()) next_maps_.clear(), ++next_maps_revision_;
     travel_started_ = now_;
     last_world_state_ = 0;
     send_world_state();
@@ -707,13 +936,20 @@ void Host::drop(std::uint64_t id, const std::string &reason, const std::string &
         roster_dirty_ = true;
         log_(name + " left (" + reason + ")" + (detail.empty() ? std::string{} : " [" + detail + "]"));
         activity_.left(id);
+        scripts_.happened(Scripts::Event::leave, id, name);
     } else {
         // Never admitted: it held a player slot meanwhile, so it shows in the log, and an ID
         // that keeps failing waits longer each time before its connection is taken again.
-        const auto failures = join_backoff_.failed(id, now_);
-        log_("[join] " + std::to_string(id) + " did not finish joining (" + reason + ")" +
-             (failures > 1 ? ", attempt " + std::to_string(failures) : std::string{}) +
-             (detail.empty() ? std::string{} : " [" + detail + "]"));
+        // Not one that was let in (past the password) and left while fetching the map: turning
+        // a download down, or stopping one, is no failed attempt, and they may come straight back.
+        if (found->second->map_authorized && found->second->fetching_since) {
+            log_("[join] " + std::to_string(id) + " left without the map (" + reason + ")");
+        } else {
+            const auto failures = join_backoff_.failed(id, now_);
+            log_("[join] " + std::to_string(id) + " did not finish joining (" + reason + ")" +
+                 (failures > 1 ? ", attempt " + std::to_string(failures) : std::string{}) +
+                 (detail.empty() ? std::string{} : " [" + detail + "]"));
+        }
     }
     guests_.erase(found);
     for (auto &[other, guest] : guests_) {
@@ -736,6 +972,8 @@ bool Host::accept_data(Guest &source, const Packet &p) {
         if (accepted) source.cosmetic_packet = encode_wire(p);
     } else if (p.kind == PacketKind::audio)
         accepted = source.sound_budget.accept(now_, p.audio.size()) && source.audio.push(p, now_);
+    else if (p.kind == PacketKind::effects)
+        accepted = config_.sync_effects && source.effect_budget.accept(now_);
     else if (p.kind == PacketKind::pose)
         accepted = source.poses.push_validated(p, now_);
     // The server never plays anything back: keep only what ordering needs.
@@ -756,9 +994,11 @@ bool Host::accept_data(Guest &source, const Packet &p) {
             if (!source.moved_at || moved > 0.05f * 0.05f || std::abs(facing) < 0.9995f) {
                 source.still_at = root;
                 source.moved_at = now_;
+                active(source);
             }
         }
-        return check_speed(source, p.time_us); // last: a speed-check kick frees `source`
+        // Last: a kick by either check frees `source`.
+        return check_board(source, p.pose) && check_speed(source, p.time_us);
     }
     return true;
 }
@@ -876,6 +1116,7 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
             return;
         link->ready_sequence = p.sequence;
         link->last_packet = now_;
+        if (p.map_fetching) fetching(*link);
         const bool arrived = p.world_ready && !link->world_ready;
         if (!p.world_ready && link->world_ready) link->loading_since = now_;
         if (arrived && config_.activity_log)
@@ -883,7 +1124,10 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
                 log_("[map] " + guest_name(*link) + " finished loading (" + std::to_string((now_ - since) / 1000000) + " s)");
         link->world_ready = p.world_ready;
         if (p.world_ready) link->travel_since = link->loading_since = 0;
-        if (arrived) meet_later(*link);
+        if (arrived) {
+            meet_later(*link);
+            active(*link); // the time away starts once they are in
+        }
         return;
     }
     case PacketKind::map_request: {
@@ -891,6 +1135,7 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
             return drop(peer, "Invalid map request. Update ReSkate to the server's version and join again.");
         if (link->handshaken) return;
         if (p.map && p.map != map_) return drop(peer, "The server changed maps while you were joining. Join again.");
+        if (p.map_fetching) fetching(*link);
         link->member.epoch = p.epoch;
         bool authorized = !password_;
         if (password_) {
@@ -907,6 +1152,7 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
             auto offer = packet(PacketKind::map_offer, now_);
             offer.destination = map_destination(config_.map);
             offer.map_label = wire_map_label();
+            offer.map_package = map_package(config_.map);
             offer.challenge = link->password_challenge;
             offer.map_authorized = authorized;
             send_required(*link, encode_wire(offer));
@@ -946,6 +1192,8 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
         link->member.epoch = p.epoch;
         if (joined) {
             link->member.name = player_name(p.text, peer);
+            if (seen_names_.size() >= 4096) seen_names_.erase(seen_names_.begin());
+            seen_names_[peer] = link->member.name;
             join_backoff_.joined(peer);
         }
         link->handshaken = true;
@@ -957,10 +1205,11 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
             send_roster();
             meet_later(*link);
             if (!config_.welcome.empty()) send_chat(config_.welcome, link);
-            log_(guest_name(*link) + " joined (" + std::to_string(peer) + (is_admin(peer) ? ", admin" : "") + "), " +
+            log_(guest_name(*link) + " joined (" + std::to_string(peer) + (role_of(peer) ? ", " + role_of(peer)->name : std::string{}) + "), " +
                  std::to_string(players()) + "/" + std::to_string(config_.max_players) + " players" +
                  (link->connected_at && now_ > link->connected_at
                       ? ", loaded in " + std::to_string((now_ - link->connected_at) / 1000000) + " s" : ""));
+            scripts_.happened(Scripts::Event::join, peer, guest_name(*link));
         }
         return;
     }
@@ -1000,18 +1249,25 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
     // A listen host's; the server's physics are the game's own.
     if (p.kind == PacketKind::physics_tuning || p.kind == PacketKind::physics_extras) return;
     if (p.kind == PacketKind::chat) {
+        active(*link);
         if (!routed_source(p, link->member, peer, true, id_) ||
             link->chat_rate.accept(now_, p.text, 1) != ChatRate::Verdict::accepted)
             return;
         link->last_packet = now_;
+        if (!allowed_words(*link, p.text)) return;
         // "/" starts a command (votes; any server command for admins), answered to the sender only.
         if (p.text.front() == '/') {
             log_("[command] " + guest_name(*link) + ": /" + loggable(std::string_view(p.text).substr(1)));
             chat_command(*link, std::string_view(p.text).substr(1));
             return;
         }
+        if (!may(peer, multiplayer::role_chat)) {
+            send_chat(role_refusal(peer, "use chat"), link);
+            return;
+        }
         log_("[chat] " + guest_name(*link) + ": " + p.text);
         broadcast(p, true, false, p.source);
+        scripts_.happened(Scripts::Event::chat, peer, guest_name(*link), p.text);
         return;
     }
     // Linked throwdowns (Extension/Throwdowns/throwdown_relay.cpp): opaque to the
@@ -1031,6 +1287,10 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
     if (p.kind == PacketKind::party) {
         if (!routed_source(p, link->member, peer, true, id_) || !link->party_budget.accept(now_, 20)) return;
         link->last_packet = now_;
+        if (!may(peer, multiplayer::role_parties)) {
+            send_chat(role_refusal(peer, "use parties"), link);
+            return;
+        }
         party_request(*link, p.party_action, p.party_player);
         return;
     }
@@ -1038,7 +1298,7 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
         if (!routed_source(p, link->member, peer, true, id_) || !link->admin_budget.accept(now_, 30)) return;
         link->last_packet = now_;
         std::string answer;
-        if (!is_admin(peer)) answer = "You are not an admin on this server.";
+        if (!is_staff(peer)) answer = "You are not an admin on this server.";
         else {
             log_("[admin] " + guest_name(*link) + ": " + loggable(p.text));
             answer = command(p.text, peer);
@@ -1055,8 +1315,10 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
     if (!routed_source(p, link->member, peer, true, id_)) return;
     if (p.kind == PacketKind::away) return drop(peer, "A player ended their session.");
     if (p.kind == PacketKind::objects) {
+        const auto before = link->objects.revision();
         if (link->objects.receive(p.objects) == ObjectState::Result::invalid)
             return drop(peer, "Invalid shared object revision or layout.");
+        if (link->objects.revision() != before) active(*link);
         link->last_packet = now_;
         return;
     }
@@ -1067,13 +1329,51 @@ void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std:
         link->received_voice = true;
         link->voice_sequence = p.sequence;
         link->last_packet = now_;
+        active(*link);
         broadcast(p, false, true, p.source);
         return;
     }
-    if (accept_data(*link, p))
-        broadcast(p, p.kind == PacketKind::audio && std::any_of(p.audio.begin(), p.audio.end(),
-                                                                [](const auto &sample) { return sample.event; }),
-                  true, p.source);
+    if (!accept_data(*link, p)) return;
+    // A pose waits until the pass has read everything (relay_poses).
+    if (p.kind == PacketKind::pose) {
+        link->relay_poses.push_back(p);
+        return;
+    }
+    // A contact's effect is only worth showing as it happens: with the server behind, a
+    // player's backlog of them is not passed on.
+    if (p.kind == PacketKind::effects && ++link->effects_pass > 2) {
+        ++shed_;
+        return;
+    }
+    broadcast(p, p.kind == PacketKind::audio && std::any_of(p.audio.begin(), p.audio.end(),
+                                                            [](const auto &sample) { return sample.event; }),
+              true, p.source);
+}
+// The poses read this pass go on to everyone. A pass normally reads one or two of each player's.
+// More means the server is behind (a stall, or more players than it can carry), and passing
+// every one of them on is what kept it behind: each pass then had the whole of the last
+// pass's arrivals to send, took as long again, and sent poses whole because the ones they
+// would have built on had gone stale, which is more work still. So of a player's backlog only
+// the newest goes on. Their skater is where they are now; the others see fewer poses of them
+// for a moment, which their games already smooth over.
+void Host::relay_poses() {
+    std::vector<Packet> poses;
+    for (auto &[id, guest] : guests_) {
+        guest->effects_pass = 0;
+        if (guest->relay_poses.empty()) continue;
+        auto own = std::exchange(guest->relay_poses, {});
+        const std::size_t first = own.size() > 3 ? own.size() - 1 : 0;
+        shed_ += first;
+        for (std::size_t index = first; index < own.size(); ++index) poses.push_back(std::move(own[index]));
+    }
+    for (const auto &pose : poses) broadcast(pose, false, true, pose.source);
+    if (shed_ != shed_logged_ && now_ - shed_log_at_ >= 30000000) {
+        log_("[network] The server is behind: " + std::to_string(shed_ - shed_logged_) +
+             " poses and effects that arrived late were not passed on. Players see each other at a lower rate until it catches up" +
+             (shed_log_at_ ? "" : "; if this keeps coming, the server has more players than its CPU can carry") + ".");
+        shed_logged_ = shed_;
+        shed_log_at_ = now_;
+    }
 }
 void Host::receive_cosmetics() {
     for (auto &[id, guest] : guests_) {
@@ -1093,6 +1393,30 @@ void Host::receive_cosmetics() {
     }
 }
 
+// Players who have been away longer than the server allows ("afk_kick_minutes") are removed,
+// with a warning a minute before. Away is doing nothing a player at their game does: not
+// moving, speaking, typing in chat or changing their objects. Admins stay, and so does anyone
+// whose game is still loading the map.
+void Host::remove_away() {
+    if (!config_.afk_kick) return;
+    const auto limit = static_cast<std::uint64_t>(config_.afk_kick) * 60000000;
+    std::vector<std::uint64_t> away;
+    for (auto &[id, guest] : guests_) {
+        auto &g = *guest;
+        if (!g.handshaken || !g.world_ready || !g.active_at || has(id, multiplayer::role_afk)) continue;
+        const auto idle = now_ - g.active_at;
+        if (idle >= limit) away.push_back(id);
+        else if (!g.away_warned && limit > 60000000 && idle >= limit - 60000000) {
+            g.away_warned = true;
+            reply(g, "You have been away a while: move or say something within a minute to stay on the server.");
+        }
+    }
+    for (const auto id : away) {
+        if (const auto *g = find(id)) log_("[afk] " + guest_name(*g) + " was removed after " + std::to_string(config_.afk_kick) + " min away.");
+        drop(id, "You were removed from the server for being away too long. You can join again.");
+    }
+}
+
 // ---- Objects ---------------------------------------------------------------------------------
 void Host::sync_objects() {
     if (now_ < next_object_update_) return;
@@ -1100,13 +1424,46 @@ void Host::sync_objects() {
     // Guests upload their layouts; the server alone decides what everyone else
     // sees, and freezes the layouts of players who may not build right now.
     for (auto &[id, guest] : guests_)
-        if (guest->handshaken && guest->objects.revision() != guest->shared_from &&
+        if (guest->handshaken && guest->objects.revision() != guest->shared_from && now_ >= guest->objects_held_until &&
             (config_.object_placement == ObjectPlacement::everyone ||
-             (config_.object_placement == ObjectPlacement::host_only && is_admin(id)))) {
+             (config_.object_placement == ObjectPlacement::host_only && has(id, multiplayer::role_objects)))) {
             auto layout = guest->objects.layout();
             std::erase_if(layout, [&](const auto &object) { return guest->cleared.contains(object.id); });
-            // No more of a player's objects than the server allows each of them; admins are not limited.
-            if (!is_admin(id)) layout = limited_layout(std::move(layout), guest->shared.objects(), config_.object_limit);
+            // No more of a player's objects than the server allows each of them; a role may lift that.
+            const bool unlimited = has(id, multiplayer::role_objects);
+            if (!unlimited) layout = limited_layout(std::move(layout), guest->shared.objects(), config_.object_limit);
+            // Nobody places objects by the hundred, minute after minute: a game that does is
+            // spawning and removing them to animate them. Theirs are deleted for everyone, and
+            // nothing they place is shared for a minute (or they would be back at once).
+            if (!unlimited) {
+                if (now_ - guest->placed_since >= 60000000) {
+                    guest->placed_since = now_;
+                    guest->placed = 0;
+                }
+                for (const auto &object : layout) guest->placed += !guest->shared.objects().contains(object.id);
+                const auto burst = 2 * (config_.object_limit ? config_.object_limit : max_owned_objects) + 100;
+                if (guest->placed > burst) {
+                    guest->objects_held_until = now_ + 60000000;
+                    guest->placed_since = guest->objects_held_until;
+                    guest->placed = 0;
+                    const auto deleted = guest->shared.objects().size();
+                    for (const auto *state : {&guest->objects, &guest->shared})
+                        for (const auto &[object, value] : state->objects()) {
+                            (void)value;
+                            guest->cleared.insert(object);
+                        }
+                    if (guest->shared.revision()) guest->shared.replace({});
+                    guest->shared_from = guest->objects.revision();
+                    log_("[objects] " + guest_name(*guest) + " (" + std::to_string(id) + ") placed over " + std::to_string(burst) +
+                         " objects in a minute: their " + std::to_string(deleted) + " objects were deleted, and none of theirs are shared for a minute.");
+                    reply(*guest, "You placed objects faster than the server allows. Yours were deleted for everyone, and none you place are shared for a minute.");
+                    continue;
+                }
+            }
+            // With scaling off, a player's objects reach everyone else at their own size, whatever
+            // that player's game made of them.
+            if (!config_.object_scaling && !unlimited)
+                for (auto &object : layout) object.scale = 1.f;
             if (config_.activity_log) activity_.objects(id, guest->shared.layout(), layout);
             guest->shared.replace(layout);
             guest->shared_from = guest->objects.revision();
@@ -1115,6 +1472,8 @@ void Host::sync_objects() {
     std::vector<Source> sources;
     for (const auto &[id, guest] : guests_)
         if (guest->handshaken && guest->world_ready) sources.push_back({id, guest->member.epoch, &guest->shared});
+    // The spawned park mods: the server's own layout, sent like a player's.
+    if (park_objects_.revision()) sources.push_back({id_, epoch_, &park_objects_});
     for (auto &[id, guest] : guests_) {
         auto &peer = *guest;
         if (!peer.handshaken || !peer.world_ready || sources.empty()) continue;
@@ -1286,6 +1645,7 @@ std::string Host::network_report(std::string_view player, bool console) {
             text += std::string(i ? ", " : " ") + guest_name(*uploads[i].guest) + " " + number(uploads[i].total) + " KB/s (" +
                     traffic_names[uploads[i].most] + " " + number(rate(uploads[i].guest->traffic, false, uploads[i].most)) + ")";
     }
+    text += "\nshed while behind: " + std::to_string(shed_) + " poses and effects not passed on (since the server started)";
     text += "\nsends: " + std::to_string(net.send_failures) + " failed, " + std::to_string(net.skipped) + " skipped, " +
             std::to_string(net.dropped) + " dropped (since the server started)";
     // The connections doing worst first: a long queue, poor delivery, silence, then ping.
@@ -1401,6 +1761,7 @@ void Host::tick(std::uint64_t now) {
         if (link.connected && !guest->connected_at) guest->connected_at = now_;
     }
     for (const auto &message : transport_.receive()) receive(message.peer, message.bytes, message.arrived);
+    relay_poses();
     flush_poses();
     receive_cosmetics();
     introduce();
@@ -1486,9 +1847,12 @@ void Host::tick(std::uint64_t now) {
     if (roster_dirty_ || now_ - last_roster_ > 2000000) send_roster();
     for (auto &[id, guest] : guests_)
         if (guest->handshaken) {
-            if (is_admin(id) && guest->bans_sent != bans_revision_) send_bans(*guest);
-            // Admins pick maps from it; with map votes on, everyone completes /vote map from it.
-            if (!guest->maps_sent && (is_admin(id) || config_.votes.map.enabled)) send_maps(*guest);
+            if ((can(id, "ban") || can(id, "unban") || can(id, "bans")) && guest->bans_sent != bans_revision_) send_bans(*guest);
+            // Whoever may change the map picks from it; with map votes on, everyone completes /vote map from it.
+            if (!guest->maps_sent && (can(id, "map") || config_.votes.map.enabled)) send_maps(*guest);
+            if (guest->permissions_sent != roles_revision_) send_permissions(*guest);
+            if (guest->words_sent != words_revision_) send_words(*guest);
+            if (guest->next_maps_sent != next_maps_revision_) send_next_maps(*guest);
         }
     const bool loading = std::any_of(guests_.begin(), guests_.end(),
                                      [](const auto &g) { return g.second->handshaken && !g.second->world_ready; });
@@ -1498,11 +1862,20 @@ void Host::tick(std::uint64_t now) {
         travel_started_ = 0;
         log_("Everyone has loaded " + map_name() + ".");
     }
+    tick_parks();
     sync_objects();
     activity_.tick(now_);
     if (std::exchange(vote_recount_, false)) check_vote(false);
     if (vote_ && now_ >= vote_->ends) check_vote(true);
+    // A finished vote has been shown long enough.
+    if (!vote_ && vote_shown_.id && now_ >= vote_shown_until_) {
+        vote_shown_ = {};
+        roster_dirty_ = true;
+    }
     tick_rotation();
+    tick_announcements();
+    scripts_.tick(); // here, outside every walk over guests_: a script may drop anyone
+    remove_away();
     std::erase_if(vote_cooldowns_, [&](const auto &entry) { return now_ >= entry.second; });
     join_backoff_.prune(now_);
 }

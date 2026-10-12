@@ -1,4 +1,5 @@
 #include "no_bail.h"
+#include "Extension/BoardBreak/board_break.h"
 #include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
@@ -59,10 +60,11 @@ struct Protection {
     std::atomic<bool> ready{};
     SRWLOCK lock = SRWLOCK_INIT;
     Lease lease;
+    std::atomic<NoBailStepObserver> step_observer{};
 };
 Protection& protection() { static auto* value = new Protection; return *value; }
 struct StateWatch {
-    std::atomic<std::uintptr_t> selector{};
+    std::atomic<std::uintptr_t> selector{}, causes{}; // the watched skater's selector and cause collector
     std::atomic<std::uint64_t> until{}, changes{}, wipeouts{};
     std::atomic<std::uint32_t> state{}, previous{};
     std::atomic<std::int64_t> since{}, previous_ticks{}; // performance-counter ticks
@@ -119,6 +121,19 @@ bool protected_owner(std::uintptr_t object, std::uintptr_t Owner::* member, Owne
     if (owner) *owner = current;
     return true;
 }
+// The published owner, its chain resolved again now; when `rig` is given, only if it is that owner's.
+bool published_skater(std::uintptr_t rig, NoBailSkater& skater) noexcept {
+    auto& p = protection();
+    if (!p.ready.load(std::memory_order_acquire)) return false;
+    AcquireSRWLockShared(&p.lock);
+    const auto published = p.lease.owner;
+    ReleaseSRWLockShared(&p.lock);
+    Owner current;
+    if (!published.entity || (rig && rig != published.rig) || !resolve(published.client, published.entity, current) ||
+        current != published) return false;
+    skater = {p.base, current.entity, current.core, current.context, current.rig};
+    return true;
+}
 bool cancel_request(std::uintptr_t context, std::uintptr_t offset, LONG mask) noexcept {
     const auto address = context + offset;
     if (context < 0x10000 || context > highest - offset - sizeof(LONG) ||
@@ -166,6 +181,7 @@ bool suppress_cause(std::uintptr_t causes, std::int32_t reason, std::uintptr_t c
 }
 void record_cause(std::uintptr_t causes, std::int32_t reason, float magnitude) {
     const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    if (causes == state_watch().causes.load(std::memory_order_acquire)) board_break::note_cause(reason, magnitude);
     const bool protect = suppress_cause(causes, reason, caller);
     // Do not force the native recovery/stumble predicate (recovery_predicate). Its
     // result is also exported to animation at +0x9e, even without a collision.
@@ -205,7 +221,11 @@ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
             w.previous.store(before, std::memory_order_relaxed);
             w.previous_ticks.store(now.QuadPart - w.since.exchange(now.QuadPart, std::memory_order_relaxed), std::memory_order_relaxed);
             w.changes.fetch_add(1, std::memory_order_relaxed);
-            if (chosen == wipeout_physics_state) w.wipeouts.fetch_add(1, std::memory_order_relaxed);
+            if (chosen == wipeout_physics_state) {
+                // Before the count: the tick that sees the new wipeout finds its cause there.
+                board_break::note_wipeout(w.causes.load(std::memory_order_acquire));
+                w.wipeouts.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     return chosen;
@@ -214,6 +234,11 @@ void skeleton_response(std::uintptr_t rig, float seconds, bool wipeout) {
     // The state post-update can raise another request after the selector ran.
     // Filter at this consumer, then let native constraints and recovery run.
     if (filter_requests(rig, &Owner::rig)) wipeout = false;
+    if (const auto observer = protection().step_observer.load(std::memory_order_acquire)) {
+        LastError error;
+        NoBailSkater skater;
+        if (published_skater(rig, skater)) observer(skater, seconds, wipeout);
+    }
     protection().skeleton_original(rig, seconds, wipeout);
 }
 bool clear_contact_output(std::uintptr_t contacts) noexcept {
@@ -391,12 +416,17 @@ void clear_no_bail() noexcept {
     p.lease = {};
     ReleaseSRWLockExclusive(&p.lock);
 }
+bool no_bail_skater(NoBailSkater& skater) noexcept { return published_skater(0, skater); }
+void set_no_bail_step_observer(NoBailStepObserver observer) noexcept {
+    protection().step_observer.store(observer, std::memory_order_release);
+}
 void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept {
     auto& w = state_watch();
     Owner owner;
     if (!protection().ready.load(std::memory_order_acquire) || !resolve(client, entity, owner)) return;
     if (w.selector.exchange(owner.selector, std::memory_order_acq_rel) != owner.selector)
         w.state.store(0, std::memory_order_release);
+    w.causes.store(owner.causes, std::memory_order_release);
     w.until.store(GetTickCount64() + 500, std::memory_order_release);
 }
 PhysicsStateWatch watched_physics_state() noexcept {

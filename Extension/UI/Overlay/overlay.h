@@ -52,6 +52,8 @@ enum class DebugAction {
     set_park_editor,
     add_up_velocity,
     set_up_velocity_speed,
+    add_offboard_up_velocity,
+    set_offboard_up_velocity_speed,
     set_first_person,
     set_first_person_fov,
     set_first_person_spring,
@@ -65,6 +67,14 @@ enum class DebugAction {
     set_first_person_spring_down,
     set_first_person_spring_left,
     set_first_person_spring_right,
+    set_first_person_stabilize,
+    set_first_person_follow_flips,
+    set_first_person_smoothing,
+    set_first_person_head_pitch,
+    set_first_person_head_roll,
+    set_first_person_bob,
+    set_first_person_board_only,
+    set_first_person_camera_cycle,
     reset_first_person_arm,
     set_free_camera_fov,  // 0 = the game's own FOV
     // Keep the last action in sync with the bound in request_scheduler.h.
@@ -100,20 +110,24 @@ struct DebugModel {
     bool noclip = false, noclip_available = false;
     bool forward_velocity_available = false;
     bool up_velocity_available = false;
+    bool offboard_up_velocity_available = false;
     std::string camera_unavailable = "Waiting for local controls.";
     std::string noclip_unavailable = "Waiting for local controls.";
     std::string forward_velocity_unavailable = "Waiting for local controls.";
     std::string up_velocity_unavailable = "Waiting for local controls.";
+    std::string offboard_up_velocity_unavailable = "Waiting for local controls.";
     bool no_bail = false, no_bail_available = false, no_bail_active = false;
     std::uint64_t noclip_velocity_updates = 0, noclip_motion_updates = 0;
     std::uint64_t forward_velocity_updates = 0;
     std::uint64_t up_velocity_updates = 0;
+    std::uint64_t offboard_up_velocity_updates = 0;
     bool game_ui_hidden = false;
     bool settings_owned = false;
     // ReSkate free-flight speed in world units per second.
     float camera_speed = 15.0f;
     float forward_velocity_speed = 20.0f;
     float up_velocity_speed = 20.0f;
+    float offboard_up_velocity_speed = 20.0f;
     bool camera_position_valid = false;
     bool skater_position_valid = false;
     std::array<float, 3> camera_position{};
@@ -191,6 +205,24 @@ struct MissionRow {
     int completed = -1;
 };
 
+// Hall of Meat's switch (Extension/HallOfMeat/hall_of_meat.h): started, and switched on.
+struct HallOfMeatModel {
+    bool available = false, enabled = false;
+};
+
+// Road Rash's switches (Extension/RoadRash/road_rash.h): started, switched on, and whether its
+// worst wounds bleed.
+struct RoadRashModel {
+    bool available = false, enabled = false, blood = false;
+};
+
+// Board Break's switch (Extension/BoardBreak/board_break.h): started, switched on, and which of
+// its decks is the one in the game (none: no deck pack loads, and no board can break).
+struct BoardBreakModel {
+    bool available = false, enabled = false, has_deck = false;
+    std::string deck = "None";
+};
+
 struct Model {
     std::string state = "Waiting for native state";
     std::string detail;
@@ -209,6 +241,9 @@ struct Model {
     WorldControlsModel world_controls;
     ProgressionModel progression;
     PlayerCardModel player_card;
+    HallOfMeatModel hall_of_meat;
+    RoadRashModel road_rash;
+    BoardBreakModel board_break;
     ObjectPersistenceModel object_persistence;
     ParkEditorModel editor;
     float menu_scale = default_menu_scale;
@@ -258,9 +293,53 @@ struct CallbacksV2 {
 using MultiplayerQueue = bool (*)(const char *action, const char *argument, const char *password,
                                  char *result, std::size_t size);
 void set_multiplayer_queue(MultiplayerQueue) noexcept;
+// A map the session needs being fetched (Extension/Assets/map_download.h), for its card.
+struct MapDownloadCard {
+    int stage{};                // 0 none, 1 asking, 2 downloading, 3 installing, 4 applying, 5 joining
+    std::string map, package, author, version, description;
+    std::string have;            // the version installed here, when the host's replaces it
+    std::size_t step{}, steps{}; // applying: the merge's steps done of all
+    std::string step_name;
+    bool server{}, installed{}, moved{}, choice{true};
+    std::uint64_t received{}, total{};
+    std::uint32_t yes_bind{}, no_bind{};
+};
+using MapDownloadFeed = MapDownloadCard (*)();
+void set_map_download_feed(MapDownloadFeed) noexcept;
+using MapDownloadAnswer = void (*)(bool download) noexcept;
+void set_map_download_answer(MapDownloadAnswer) noexcept;
+// The card's icon: the package's own picture as PNG bytes, or nothing to show a plain tile.
+// Any thread; decoded here and uploaded when the overlay next draws.
+void set_map_download_icon(const std::string& png) noexcept;
+// The pictures for a dedicated server's vote for the next map (Extension/Assets/map_icons.h):
+// each map's name in the vote and its picture: a mod's icon as PNG bytes, or one of the game's
+// own maps' as pixels (straight-alpha RGBA, a square of `side`). Neither: it has none. Any thread.
+struct MapVoteIcon {
+    std::string name, png;
+    std::vector<unsigned char> rgba;
+    unsigned side{};
+};
+void set_map_vote_icons(const std::vector<MapVoteIcon>& icons) noexcept;
+// That vote's popup (map_download_card.cpp), for the runtime, which reads the controller and
+// holds the game's input while it is up: whether it is, moving the pick, voting for the pick
+// (the popup then closes), and closing it without a vote. Any thread.
+bool map_vote_asking() noexcept;
+void map_vote_move(int by) noexcept;
+void map_vote_take() noexcept;
+void map_vote_dismiss() noexcept;
 // The session's text chat, read by the chat panel every frame (thread-safe, cheap).
 using ChatFeed = MultiplayerChat (*)();
 void set_chat_feed(ChatFeed) noexcept;
+// The game's pause menu, as far as ReSkate's own pages in it go: whether one of them is the
+// page on screen, and which (`section` 0: Multiplayer, 1: Mod Options). The overlay draws
+// everything in such a page itself, its tabs too (hub_page.cpp). Read every presented frame
+// (thread-safe, cheap).
+struct HubPage {
+    bool visible{};
+    int section{};
+};
+using HubPageFeed = HubPage (*)();
+void set_hub_page_feed(HubPageFeed) noexcept;
 // Text the game draws with its debug text natives, where retail draws nothing (the
 // S.K.A.T.E. throwdown HUD). One frame of lines, positioned in a width x height screen;
 // color is R, G, B, A bytes (ImGui's IM_COL32 layout). Read every presented frame
@@ -312,7 +391,7 @@ struct Nametag {
     std::array<float, 3> position{}; // above the skater's head, world space
     std::string name;
     std::uint32_t color{0xffffffffU}; // R, G, B, A bytes (IM_COL32)
-    std::string tag;                  // role badge before the name ("Dev", "Staff", "Creator", "Centrix", "Homie", "Admin", "Host", "Friend")
+    std::string tag;                  // role badge before the name ("Dev", "Staff", "Content Creator", "Centrix", "Homie", "Admin", "Host", "Friend")
     float distance{};                 // metres from the local skater
     bool talking{};
     // Recent chat lines to show as bubbles above the head, oldest first ("" = none).
@@ -332,6 +411,23 @@ struct Nametags {
 };
 using NametagFeed = Nametags (*)();
 void set_nametag_feed(NametagFeed) noexcept;
+// The skater item grids' favorites, search and filter (item_browser_overlay.cpp): what the host's
+// grids show now, and what the keys ask of them. The view is read while a grid is open; every
+// function is thread-safe and only queues work for the client thread.
+struct ItemBrowserView {
+    bool open{};                // an item grid has the focus
+    std::string search, filter; // the search text and the filter's name
+    unsigned shown{}, total{};  // tiles in the grid that has the focus
+    bool focused_favorite{};    // the highlighted item is a favorite
+};
+struct ItemBrowserHost {
+    ItemBrowserView (*view)(){};
+    void (*toggle_favorite)(){};
+    void (*set_search)(const char *text){};
+    void (*cycle_filter)(){};
+};
+// `host` must stay valid for the life of the process.
+void set_item_browser(const ItemBrowserHost *host) noexcept;
 using ParkSurfaceQueue = bool (*)(const EditorSurfaceRequest &);
 void set_park_surface_queue(ParkSurfaceQueue) noexcept;
 using ParkPreviewQueue = bool (*)(const EditorPreviewRequest &);
@@ -353,6 +449,15 @@ struct CallbacksV3 {
     bool (*queue_console_command)(void* user, const char* command,
                                   char* result, std::size_t result_size) = nullptr;
 };
+
+// Plays one of the game's own menu sounds, by its number in the game's list (ui_sound.h: 3
+// moving the focus, 7 pressing something, 56 changing tab). Any thread.
+using UiSound = void (*)(std::uint32_t sound) noexcept;
+void set_ui_sound(UiSound) noexcept;
+// What those pages read the game with and act through: callbacks as the overlay's own, with a
+// read_model that takes a snapshot and leaves the console log alone (it is asked a few times a
+// second while a page is drawn).
+void set_hub_callbacks(const CallbacksV3 &callbacks) noexcept;
 
 struct Status {
     bool started = false;
@@ -391,6 +496,13 @@ extern "C" __declspec(dllexport) void DingoSDKOverlayGetStatus(dingosdk::overlay
 // Poll only on the client update thread. Returns no input while either overlay
 // surface is open, the game is unfocused, or the overlay has stopped.
 extern "C" void DingoSDKOverlayReadFlightInput(dingosdk::overlay::FlightInput* input, bool flight_active, bool player_flight = false);
+extern "C" void DingoSDKOverlaySetFreecamInputCapture(bool active);
+// The same hold on the game's input while a card asks something of the player and a
+// controller answers it (the map download's): the buttons that answer must not also skate.
+extern "C" void DingoSDKOverlaySetPromptInputCapture(bool active);
+// The keyboard keys such a card answers to, read past that hold: bit 0 left, 1 right, 2 Enter,
+// 3 Esc. Nothing while the game is not in front or the menu, console or chat has the keys.
+extern "C" unsigned DingoSDKOverlayReadPromptKeys();
 // allow_menu is used only by the Binds page while recording. Focus and lifetime
 // gates still apply. Gameplay callers leave it false.
 extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* input, bool allow_menu = false);
